@@ -1,0 +1,293 @@
+"""What language Aria hears, thinks in, and speaks - as one profile per call.
+
+Language is not one setting. Getting a Hindi call right means five things
+agreeing with each other, and any one of them left on its English default is
+enough to break the call:
+
+  1. **ASR** must be told the language, or Deepgram transcribes Hindi audio as
+     English-shaped nonsense and the model answers the nonsense.
+  2. **The voice** must match. MiniMax voice IDs are language-specific;
+     `English_captivating_female1` reading Devanagari is not accented Hindi,
+     it is unusable.
+  3. **`language_boost`** biases MiniMax's own pronunciation. Left unset, a
+     Hindi voice still mispronounces mixed English product names.
+  4. **The prompt** has to say which language to reply in. The model will
+     answer an English-transcribed question in English no matter what the
+     audio was.
+  5. **Everything we speak in code** - greeting, failure line, bridge lines -
+     is written by us, not the model, so it stays English unless it is
+     translated here. A Hindi call that suddenly says "let me pull that up
+     for you" mid-turn is worse than an English one.
+
+Hence a profile rather than a language code: the five move together or not at
+all.
+
+Vendor support, checked against the vendors' own documentation:
+
+* Deepgram nova-3 lists `hi`, and a `multi` mode covering English, Spanish,
+  French, German, Hindi, Russian, Portuguese, Japanese, Italian and Dutch.
+  `multi` is what a real Indian B2B call needs - a buyer discussing device
+  fleets code-switches between Hindi and English inside a single sentence, and
+  a recogniser pinned to `hi` mangles the English half.
+* MiniMax publishes three Hindi system voices and a top-level `language_boost`
+  parameter that accepts "Hindi" or "auto".
+* Agora forwards any parameter it does not itself validate straight to the
+  vendor, which is what lets `language_boost` through at all.
+
+None of this is confirmed on a live call yet - see the note in the README.
+Agora validates vendor/model/url against its own allowlist under managed
+credentials, and this account has already had one (vendor, model) combination
+refused for its SKU, so a Hindi voice being available to us is a reasonable
+expectation rather than a measured fact.
+"""
+from __future__ import annotations
+
+import re
+
+from pydantic import BaseModel, Field
+
+# MiniMax speech-2.8 delivery markup: `<#x#>` pause tags and
+# (breath)/(sighs)/(laughs) interjections, embedded directly in every
+# greeting/failure/filler string below and in bridge_lines.py. Only speech-2.8
+# renders them as audio - every other vendor, including Sarvam, would speak
+# them as literal text ("open paren breath close paren"), so anything bound
+# for a non-minimax TTS needs this run over it first.
+_MARKUP = re.compile(r"<#[\d.]+#>|\((?:breath|sighs|laughs)\)")
+
+
+def strip_speech_markup(text: str) -> str:
+    """Removes MiniMax-only delivery markup, collapsing the whitespace it
+    leaves behind so the stripped line still reads as one sentence."""
+    return re.sub(r"\s{2,}", " ", _MARKUP.sub("", text)).strip()
+
+
+class LanguageProfile(BaseModel):
+    """One coherent set of the five settings above."""
+
+    code: str
+    label: str
+
+    # Deepgram language code, sent as asr.params.language.
+    asr_language: str
+    # MiniMax system voice id, and its language_boost value ("auto" lets
+    # MiniMax detect per utterance, which is what a mixed call needs).
+    voice_id: str
+    language_boost: str
+    # Aria's voice per language of the reply, for a profile that genuinely
+    # has two. Empty on a single-language profile: an English deployment that
+    # quotes a Hindi company name has no second voice to switch to and no
+    # reason to want one.
+    alternate_voices: dict[str, str] = Field(default_factory=dict)
+    # A voice per layer, so a handoff to the second layer is audible. When
+    # Aria goes to the deal desk a different agent really does answer - its
+    # own prompt, its own model call, its own objective - and until now the
+    # customer heard all of it in her voice, which made the layering invisible
+    # to the person it was built for.
+    agent_voices: dict[str, str] = Field(default_factory=dict)
+    # Sarvam equivalents of voice_id/agent_voices above. Sarvam speakers are
+    # cross-lingual - the same speaker id works under any target_language_code
+    # - so there is no per-language variant to carry the way MiniMax needs one.
+    # Speaker names are bulbul:v3's - Sarvam deprecated bulbul:v2 (confirmed
+    # live: "Model 'bulbul:v2' has been deprecated") which is what Agora's own
+    # docs still document the speaker list for (anushka/abhilash/karun etc) -
+    # those 400 against the current API. priya/kabir/dev are v3 names.
+    sarvam_speaker: str = ""
+    sarvam_language_code: str = ""
+    sarvam_agent_speakers: dict[str, str] = Field(default_factory=dict)
+    # MiniMax's digit/abbreviation expansion is an English/Chinese feature.
+    # Leaving it on for a Hindi voice spends latency on a pass that does not
+    # apply.
+    english_normalization: bool
+    # MiniMax voice_setting.speed. 0.96 reads as considered rather than rushed
+    # in English; the Hindi voices already read slower, so the same value
+    # there lands as sluggish. A dial rather than a finding - retune by ear.
+    speech_speed: float = 0.96
+
+    # Spoken by Agora, not the model - see the fields it feeds in
+    # agora/join_payload.py.
+    greeting: str
+    failure_message: str
+    filler_phrases: list[str] = Field(default_factory=list)
+
+    # Appended to the system prompt. The persona itself stays in English:
+    # translating a 2,000-word prompt would be a second thing to keep in sync
+    # with every behaviour change, and instructing an output language works.
+    prompt_instruction: str
+
+
+ENGLISH = LanguageProfile(
+    code="en",
+    label="English",
+    asr_language="en",
+    voice_id="English_captivating_female1",
+    language_boost="English",
+    english_normalization=True,
+    agent_voices={
+        "aria": "English_captivating_female1",
+        # Clipped and male, so the change of person registers in one word.
+        "deal_desk": "English_Trustworth_Man",
+        "solutions": "English_Gentle-voiced_man",
+    },
+    sarvam_speaker="priya",
+    sarvam_language_code="en-IN",
+    sarvam_agent_speakers={
+        "aria": "priya",
+        "deal_desk": "kabir",
+        "solutions": "dev",
+    },
+    greeting=(
+        "Thanks for calling Apple Business Sales, "
+        "Apple Park, One Apple Park Way in Cupertino. <#0.25#> "
+        "This is Aria speaking. <#0.2#> And who do I have the pleasure of speaking with today?"
+    ),
+    failure_message="(breath) Sorry — could you say that once more? I didn't quite catch it.",
+    filler_phrases=[
+        "Let me pull that up for you. <#0.3#> One second.",
+        "Sure <#0.2#> give me just a second.",
+        "(breath) Okay, let me check that.",
+        "Mm, <#0.2#> one moment, I'm looking at it now.",
+        "Let me get you the exact number on that. <#0.3#> Bear with me.",
+        "Right, <#0.2#> just pulling that up.",
+    ],
+    prompt_instruction="",
+)
+
+
+# Devanagari throughout rather than transliteration: MiniMax's Hindi voices are
+# trained on the script, and romanised Hindi ("aap kaise hain") is read as
+# English words by a TTS engine.
+HINDI = LanguageProfile(
+    code="hi",
+    label="Hindi",
+    asr_language="hi",
+    voice_id="hindi_female_1_v2",
+    language_boost="Hindi",
+    english_normalization=False,
+    speech_speed=1.02,
+    agent_voices={
+        "aria": "hindi_female_1_v2",
+        # MiniMax labels this one "Trustworthy Advisor", which is the deal
+        # desk's job description.
+        # One Hindi male voice is all MiniMax offers under managed mode, and
+        # it goes to the solutions engineer: on the demo call that is the
+        # handoff that needs to land as a different person. The deal desk
+        # gets the second female voice.
+        "deal_desk": "hindi_female_2_v1",
+        "solutions": "hindi_male_1_v2",
+    },
+    sarvam_speaker="priya",
+    sarvam_language_code="hi-IN",
+    sarvam_agent_speakers={
+        "aria": "priya",
+        "deal_desk": "kabir",
+        "solutions": "dev",
+    },
+    greeting=(
+        "Apple Business Sales में आपका स्वागत है. <#0.25#> "
+        "मैं Aria बोल रही हूँ. <#0.2#> आपका शुभ नाम क्या है?"
+    ),
+    failure_message="(breath) माफ़ कीजिए — क्या आप एक बार फिर कह सकते हैं? मैं ठीक से सुन नहीं पाई.",
+    filler_phrases=[
+        "एक सेकंड <#0.3#> मैं अभी देखती हूँ.",
+        "जी <#0.2#> बस एक पल दीजिए.",
+        "(breath) ठीक है, मैं चेक करती हूँ.",
+        "एक मिनट <#0.25#> मैं अभी निकालती हूँ.",
+    ],
+    prompt_instruction=(
+        "THE CALLER IS SPEAKING HINDI. Reply in Hindi, written in Devanagari script - "
+        "your text is spoken aloud by a Hindi voice, and romanised Hindi gets read out as "
+        "English words. Keep product names, model names and anything a tool handed you "
+        "pre-formatted (meeting slot labels, price summaries) exactly as they were given "
+        "to you, in English. That is not a compromise - it is how this conversation is "
+        "actually held in an Indian office, and re-spelling 'MacBook Air' or a date in "
+        "Devanagari makes you harder to understand, not easier."
+    ),
+)
+
+
+# The one most Indian B2B calls actually need. A buyer discussing a device
+# fleet switches between Hindi and English inside a single sentence, and a
+# recogniser pinned to either one mangles the other half.
+HINGLISH = LanguageProfile(
+    code="hinglish",
+    label="English by default, Hindi/English code-switching on request",
+    asr_language="multi",
+    voice_id="English_captivating_female1",
+    language_boost="auto",
+    english_normalization=False,
+    speech_speed=1.02,
+    # The only profile where this matters: the caller switches language
+    # mid-call, and a Hindi voice reading an English sentence is that sentence
+    # in a Hindi accent. Noticeable, and on a call where they just switched
+    # deliberately it reads as not having noticed.
+    alternate_voices={
+        "hi": "hindi_female_1_v2",
+        "en": "English_captivating_female1",
+    },
+    agent_voices={
+        "aria": "English_captivating_female1",
+        # One Hindi male voice is all MiniMax offers under managed mode, and
+        # it goes to the solutions engineer: on the demo call that is the
+        # handoff that needs to land as a different person. The deal desk
+        # gets the second female voice. Both stay Hindi-voiced even in this
+        # English-default profile - a call only reaches them after it's gone
+        # deep enough to need a specialist, and by then a call that switched
+        # to Hindi has usually stayed there.
+        "deal_desk": "hindi_female_2_v1",
+        "solutions": "hindi_male_1_v2",
+    },
+    # Pinned for the whole call: Sarvam has no per-utterance "auto" language
+    # mode to match MiniMax's language_boost, so a mid-call switch would need
+    # voice_switching_enabled (off by default). Pinned to English, matching
+    # this profile's default now rather than Hindi.
+    sarvam_speaker="priya",
+    sarvam_language_code="en-IN",
+    sarvam_agent_speakers={
+        "aria": "priya",
+        "deal_desk": "kabir",
+        "solutions": "dev",
+    },
+    greeting=(
+        "Thanks for calling Apple Business Sales, "
+        "Apple Park, One Apple Park Way in Cupertino. <#0.25#> "
+        "This is Aria speaking. <#0.2#> And who do I have the pleasure of speaking with today?"
+    ),
+    failure_message="(breath) Sorry — could you say that once more? I didn't quite catch it.",
+    filler_phrases=[
+        "Let me pull that up for you. <#0.3#> One second.",
+        "Sure <#0.2#> give me just a second.",
+        "(breath) Okay, let me check that.",
+        "Mm, <#0.2#> one moment, I'm looking at it now.",
+    ],
+    prompt_instruction=(
+        "DEFAULT TO ENGLISH. Open and continue in English unless one of two things "
+        "happens: the caller actually speaks to you in Hindi (a real Hindi sentence or "
+        "phrase, not a single loanword), or they explicitly ask you to speak Hindi "
+        "('hindi mein baat karo', 'can you speak Hindi'). Only then switch - and once you "
+        "switch, keep matching them for the rest of the call the way an Indian office "
+        "conversation actually code-switches: Hindi for the conversation, English for "
+        "product names, numbers, dates and technical terms. Write any Hindi in Devanagari "
+        "script, never romanised - romanised Hindi is read out as English words by the "
+        "voice engine. If they go back to English, go back with them. Anything a tool "
+        "handed you pre-formatted - a meeting slot label, a price summary - is said "
+        "exactly as given, in English, regardless of what language the rest of the turn "
+        "is in. Do not translate it and do not recalculate it."
+    ),
+)
+
+
+PROFILES: dict[str, LanguageProfile] = {
+    ENGLISH.code: ENGLISH,
+    HINDI.code: HINDI,
+    HINGLISH.code: HINGLISH,
+}
+
+
+def get_profile(code: str) -> LanguageProfile:
+    """Falls back to English on anything unrecognised rather than raising.
+
+    This is read while building the /join payload for a live call. A typo in
+    AGENT_LANGUAGE should cost the wrong language, not a call that cannot
+    start.
+    """
+    return PROFILES.get((code or "").strip().lower(), ENGLISH)
